@@ -32,6 +32,7 @@
 require("dotenv").config();
 
 const {
+  Account,
   Keypair,
   SorobanRpc,
   TransactionBuilder,
@@ -145,6 +146,27 @@ function isPermanentError(err) {
 // Soroban helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Encodes a Soroban symbol as the base64 XDR string `getEvents` expects for a
+ * topic filter. Derived at runtime so the filter always matches the symbol
+ * written here, and a contract-side rename surfaces as a code change rather
+ * than a filter that silently stops matching.
+ */
+function topicSymbol(name) {
+  if (name.length > 9) {
+    throw new Error(`Symbol "${name}" is too long for a topic (max 9 chars)`);
+  }
+  return nativeToScVal(name, { type: "symbol" }).toXDR("base64");
+}
+
+// Contract event topics, derived from symbols at runtime.
+// See keeper-registry/src/lib.rs for the emitting `publish_event` calls.
+const REGISTRY_EVENTS = {
+  taskRegistered: [topicSymbol("reg"), topicSymbol("task")],
+  taskClaimed: [topicSymbol("claim"), topicSymbol("task")],
+  taskExecuted: [topicSymbol("exec"), topicSymbol("task")],
+};
+
 async function simulateAndSend(server, keypair, networkPassphrase, tx) {
   const simResponse = await server.simulateTransaction(tx);
   if (SorobanRpc.Api.isSimulationError(simResponse)) {
@@ -190,6 +212,40 @@ async function invokeContract(server, keypair, networkPassphrase, contractId, me
   return simulateAndSend(server, keypair, networkPassphrase, tx);
 }
 
+/**
+ * Simulates a read-only contract call. Does not sign or send a transaction,
+ * so this costs nothing. Used for pre-flight checks like `is_claimable`.
+ */
+async function readContract(server, sourceAddress, networkPassphrase, contractId, method, args) {
+  const contract = new Contract(contractId);
+
+  // We can use a dummy account for read-only simulations.
+  const sourceAccount = new Account(sourceAddress, "0");
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+    // Note: `source` is required for simulation, but the sequence number is
+    // not. We use a dummy account with sequence "0".
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const simResponse = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simResponse)) {
+    throw new Error(`Simulation failed: ${simResponse.error}`);
+  }
+
+  if (!simResponse.result) {
+    // This should not happen if simulation didn't error, but check just in case.
+    throw new Error("Simulation failed: no result returned");
+  }
+
+  return scValToNative(simResponse.result.retval);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Task fetching — reads pending tasks by querying events
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,16 +253,14 @@ async function invokeContract(server, keypair, networkPassphrase, contractId, me
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
   try {
-    // Query TaskRegistered events (topic: ["reg", "task"])
+    // Query TaskRegistered events
     const response = await server.getEvents({
       startLedger,
       filters: [
         {
           type: "contract",
           contractIds: [contractId],
-          topics: [
-            ["AAAADwAAAANyZWc=", "AAAADwAAAAR0YXNr"], // "reg", "task" as base64 XDR
-          ],
+          topics: [REGISTRY_EVENTS.taskRegistered],
         },
       ],
       limit: 100,
@@ -268,6 +322,15 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
   const pendingTasks = await fetchPendingTasks(server, contractId, startLedger);
   console.log(`  📋  Found ${pendingTasks.length} TaskRegistered events to evaluate`);
 
+  if (pendingTasks.length === 0) {
+    consecutiveEmptyRounds++;
+    if (consecutiveEmptyRounds > 0 && consecutiveEmptyRounds % 30 === 0) {
+      console.warn(`  ⚠️  No tasks found for ${consecutiveEmptyRounds} consecutive rounds. Is the bot disconnected or the contract inactive?`);
+    }
+  } else {
+    consecutiveEmptyRounds = 0;
+  }
+
   let processed = 0;
   for (const task of pendingTasks) {
     if (processed >= CONFIG.maxTasksPerRound) break;
@@ -294,8 +357,26 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
     }
 
     try {
+      // Pre-flight check: is the task actually claimable right now? This is a
+      // read-only simulation that costs nothing.
+      const isClaimable = await readContract(
+        server,
+        keypair.publicKey(),
+        networkPassphrase,
+        contractId,
+        "is_claimable",
+        [nativeToScVal(task.taskId, { type: "u64" })]
+      );
+
+      if (!isClaimable) {
+        console.log(`  ⏩  Task ${task.taskId} not claimable, skipping.`);
+        continue; // Does not count towards processed tasks.
+      }
+
       console.log(`  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`);
 
+      // The pre-check is advisory. A competitor can still win the race and
+      // claim the task between our simulation and our submission.
       // 1. Claim the task (retry transient RPC errors; bail on "already claimed")
       await withRetry(`claim_task ${task.taskId}`, () =>
         invokeContract(server, keypair, networkPassphrase, contractId, "claim_task", [
@@ -383,6 +464,7 @@ async function main() {
   let shuttingDown = false;
   let roundInFlight = false;
   let timer = null;
+  let consecutiveEmptyRounds = 0;
 
   function requestShutdown(signal) {
     if (shuttingDown) return;
